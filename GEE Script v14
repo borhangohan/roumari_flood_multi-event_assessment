@@ -1,0 +1,1380 @@
+// =============================================================================
+// FLOOD MAPPING & VALIDATION — v15 (merged)
+// Roumari Upazila, Kurigram, Bangladesh
+//
+// YEAR SELECTION:
+//   Set YEAR = '2019' or YEAR = '2020' or YEAR = '2023' or YEAR = '2024' at the top of Section 0.
+// =============================================================================
+
+// =============================================================================
+// 0. CONFIGURATION
+// =============================================================================
+
+var YEAR = '2019';   // ← change to '2019' or '2020'
+
+// Per-year date windows
+var DATE_2019 = {
+  baseline_start: '2019-03-01',
+  baseline_end:   '2019-04-30',
+  flood_start:    '2019-07-19',
+  flood_end:      '2019-08-02',
+  opt_ext_start:  '2019-06-15',
+  opt_ext_end:    '2019-08-25',
+  opt_res_start:  '2019-07-19',
+  opt_res_end:    '2019-08-02',
+  ndvi_start:     '2019-06-01',
+  ndvi_end:       '2019-07-18',
+  gfm_asset:      'projects/ee-2221128/assets/gfm_2019_jul_flood_binary'
+};
+
+var DATE_2020 = {
+  baseline_start: '2020-03-01',
+  baseline_end:   '2020-04-30',
+  flood_start:    '2020-06-21',
+  flood_end:      '2020-07-27',
+  opt_ext_start:  '2020-06-01',
+  opt_ext_end:    '2020-08-15',
+  opt_res_start:  '2020-06-21',
+  opt_res_end:    '2020-07-27',
+  ndvi_start:     '2020-06-01',
+  ndvi_end:       '2020-07-20',
+  gfm_asset:      'projects/ee-2221128/assets/gfm_2020_jul_flood_binary'
+};
+
+var DATE_2023 = {
+  baseline_start: '2023-03-01',
+  baseline_end:   '2023-04-30',
+  flood_start:    '2023-08-05',
+  flood_end:      '2023-08-29',
+  opt_ext_start:  '2023-07-15',
+  opt_ext_end:    '2023-09-15',
+  opt_res_start:  '2023-08-05',
+  opt_res_end:    '2023-08-29',
+  ndvi_start:     '2023-07-01',
+  ndvi_end:       '2023-08-18',
+  gfm_asset:      'projects/ee-2221128/assets/gfm_2023_jul_flood_binary'
+};
+
+var DATE_2024 = {
+  baseline_start: '2024-03-01',
+  baseline_end:   '2024-04-30',
+  flood_start:    '2024-06-22',
+  flood_end:      '2024-07-16',
+  opt_ext_start:  '2024-06-01',
+  opt_ext_end:    '2024-07-31',
+  opt_res_start:  '2024-06-22',
+  opt_res_end:    '2024-07-16',
+  ndvi_start:     '2024-06-01',
+  ndvi_end:       '2024-07-10',
+  gfm_asset:      'projects/ee-2221128/assets/gfm_2024_jul_flood_binary'
+};
+
+var DATE = (YEAR === '2019') ? DATE_2019 : DATE_2020;
+
+var THR = {
+  vh_db:          -5.5,
+  vv_db:          -3.5,   // manual fallback for VV; Otsu is primary
+  ratio_db:       -3.5,
+  ndwi:            0.3,
+  mndwi:           0.3,
+  min_obs:         2,
+  max_cloud_s2:   95,
+  max_cloud_l8:   90,
+  ndvi_veg:        0.4,
+  slope_deg:       5,
+  jrc_months:      1,
+  texture_max:     0.5,
+  min_patch_px:    9,
+  rf_water_m:      2.0,
+  rf_land_m:       3.0,
+  rf_prob:         0.5,
+  rf_fill:        -9999,
+  s11_px_per_chip: 500,
+  // Multi-pol frequency threshold mirrors the 50% optical persistence used in
+  // the S2+L8 validation reference.
+  mp_freq_min:     0.5
+};
+
+// Stage 1: S1-only features (Sen1Floods11 RF)
+var S11_FEAT = ['VH', 'VV', 'VV_VH_ratio', 'VH_texture'];
+
+// Stage 2: full local RF features + Stage 1 probability
+var RF_FEAT = [
+  'VH_flood',
+  'VH_change', 'VH_baseline', 'VV_flood', 'VV_VH_ratio',
+  'VH_texture', 'slope', 'twi', 'jrc_occurrence', 'jrc_seasonality',
+  's11_prob'
+];
+
+var CV_ROWS  = 2;
+var CV_COLS  = 3;
+var RF_TREES = 150;
+
+// =============================================================================
+// 1. STUDY AREA
+// =============================================================================
+
+var admin3 = ee.FeatureCollection('projects/ee-2221128/assets/bgd_admin3');
+var AOI    = admin3.filter(ee.Filter.eq('adm3_name', 'Roumari')).geometry();
+
+Map.centerObject(AOI, 12);
+Map.addLayer(AOI, {color: 'red'}, '0. Roumari Boundary', true);
+
+// =============================================================================
+// 2. ANCILLARY DATA
+// =============================================================================
+
+var srtm    = ee.Image('USGS/SRTMGL1_003');
+var slope   = ee.Terrain.slope(srtm).rename('slope').clip(AOI);
+var flatMask = slope.lt(THR.slope_deg);
+
+var tanSlope     = slope.multiply(Math.PI / 180).tan().max(0.001);
+var upslopeProxy = ee.Image(1).reduceNeighborhood({
+  reducer: ee.Reducer.sum(), kernel: ee.Kernel.square(5)
+});
+var twi = upslopeProxy.divide(tanSlope).log().rename('twi').clip(AOI);
+
+var jrc     = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').clip(AOI);
+var jrcOcc  = jrc.select('occurrence').unmask(0).rename('jrc_occurrence');
+var jrcSeas = jrc.select('seasonality').unmask(0).rename('jrc_seasonality');
+
+var riverRaw    = jrcSeas.gte(THR.jrc_months);
+var riverSmooth = riverRaw
+  .focal_max(60,'circle','meters').focal_min(60,'circle','meters')
+  .focal_median(30,'circle','meters').focal_mode(30,'circle','meters')
+  .toInt().rename('river');
+var nonRiverMask = riverSmooth.eq(0);
+var jrcWetMask   = jrcOcc.unmask(0).gte(10).rename('jrc_wet');
+
+var esaLC    = ee.ImageCollection('ESA/WorldCover/v200').first().clip(AOI);
+var cropMask = esaLC.eq(40).rename('cropland');
+
+Map.addLayer(cropMask.selfMask(),    {palette:['#f5d020']}, '0. Cropland (ESA)',  false);
+Map.addLayer(riverSmooth.selfMask(), {palette:['#c0392b']}, '0. Rivers (JRC)',    false);
+Map.addLayer(twi, {min:0,max:15,palette:['white','#aed6f1','#1a5276']}, '0. TWI', false);
+
+// =============================================================================
+// 3. PRE-FLOOD NDVI MASK
+// =============================================================================
+
+function maskS2Clouds(img) {
+  var scl = img.select('SCL');
+  return img.updateMask(
+    scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10)).and(scl.neq(11))
+  );
+}
+
+var s2Pre = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(AOI).filterDate(DATE.ndvi_start, DATE.ndvi_end)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+  .select(['B4','B8','SCL'])
+  .map(function(img){ return img.clip(AOI); })
+  .map(maskS2Clouds);
+
+var preNDVI  = s2Pre.map(function(img){
+  return img.normalizedDifference(['B8','B4']).rename('NDVI');
+}).median();
+
+var nonVegMask = preNDVI.lt(THR.ndvi_veg).unmask(1).rename('nonveg');
+
+Map.addLayer(preNDVI,
+  {min:0,max:0.8,palette:['white','#82c982','#1a5c1a']}, '0. Pre-flood NDVI', false);
+
+// =============================================================================
+// 4. GFM
+// =============================================================================
+
+var gfmSmoothed = ee.Image(DATE.gfm_asset)
+  .clip(AOI).select([0])
+  .focal_median(30,'circle','meters')
+  .focal_mode(60,'circle','meters')
+  .toInt().rename('gfm_flood');
+
+Map.addLayer(gfmSmoothed.selfMask(), {palette:['#e67e22']}, '1. GFM (reference)', true);
+
+// =============================================================================
+// 5. SENTINEL-1 SAR PREPARATION
+// =============================================================================
+
+var s1BaseCol  = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(AOI).filterDate(DATE.baseline_start, DATE.baseline_end)
+  .filter(ee.Filter.eq('orbitProperties_pass','ASCENDING'))
+  .filter(ee.Filter.eq('instrumentMode','IW'))
+  .select(['VV','VH']);
+var s1BaseMean = s1BaseCol.mean().clip(AOI);
+
+// Linear baselines for change ratio computation
+var baseVHLin = ee.Image(10).pow(s1BaseMean.select('VH').divide(10));
+var baseVVLin = ee.Image(10).pow(s1BaseMean.select('VV').divide(10));
+
+var s1FloodCol = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(AOI).filterDate(DATE.flood_start, DATE.flood_end)
+  .filter(ee.Filter.eq('orbitProperties_pass','ASCENDING'))
+  .filter(ee.Filter.eq('instrumentMode','IW'))
+  .select(['VV','VH']);
+
+var s1FloodMean = s1FloodCol.mean().clip(AOI);
+
+// Per-scene VH change (dB) — used by A-VH, B-Otsu, C-MultiPol
+var changePerScene = s1FloodCol.map(function(img) {
+  img = img.clip(AOI);
+  var fLin = ee.Image(10).pow(img.select('VH').divide(10));
+  return fLin.divide(baseVHLin).log10().multiply(10)
+    .rename('VH_change_db')
+    .copyProperties(img, ['system:time_start']);
+});
+var vhChangeMean = changePerScene.mean().rename('VH_change_db').clip(AOI);
+
+// Per-scene VV change (dB) — used by B-VV, C-MultiPol
+var changePerScene_VV = s1FloodCol.map(function(img) {
+  img = img.clip(AOI);
+  var fLin = ee.Image(10).pow(img.select('VV').divide(10));
+  return fLin.divide(baseVVLin).log10().multiply(10)
+    .rename('VV_change_db')
+    .copyProperties(img, ['system:time_start']);
+});
+var vvChangeMean = changePerScene_VV.mean().rename('VV_change_db').clip(AOI);
+
+// Derived bands
+var vhFloodLin = ee.Image(10).pow(s1FloodMean.select('VH').divide(10)).rename('VH_linear');
+var vhTexture  = vhFloodLin.reduceNeighborhood({
+  reducer: ee.Reducer.variance(), kernel: ee.Kernel.square(1)
+}).rename('VH_texture');
+
+var vhFlood   = s1FloodMean.select('VH').rename('VH_flood');
+var vvFlood   = s1FloodMean.select('VV').rename('VV_flood');
+var vvVhRatio = vvFlood.subtract(vhFlood).rename('VV_VH_ratio');
+var vhChange  = vhChangeMean.rename('VH_change');
+var vhBase    = s1BaseMean.select('VH').rename('VH_baseline');
+var vvBase    = s1BaseMean.select('VV').rename('VV_baseline');
+var s1Mask    = s1FloodMean.select('VH').mask();
+
+// =============================================================================
+// 6. FEATURE STACK BASE (terrain + JRC; s11_prob added after Stage 1)
+// =============================================================================
+
+var featureStackBase = vhFlood
+  .addBands(vhChange)
+  .addBands(vhBase)
+  .addBands(vvFlood)
+  .addBands(vvVhRatio)
+  .addBands(vhTexture)
+  .addBands(slope)
+  .addBands(twi)
+  .addBands(jrcOcc)
+  .addBands(jrcSeas)
+  .clip(AOI)
+  .unmask(THR.rf_fill);
+
+// =============================================================================
+// 7. HELPER FUNCTIONS
+// =============================================================================
+
+function countPx(img, label) {
+  img.rename('f').selfMask()
+    .reduceRegion({reducer:ee.Reducer.count(),geometry:AOI,scale:30,maxPixels:1e10,bestEffort:true})
+    .evaluate(function(r,e){
+      if(e||!r){ print('  [px] '+label+' ERROR'); return; }
+      print('  [px] '+label+': '+r.f+' px ('+((r.f*900)/10000).toFixed(0)+' ha)');
+    });
+}
+
+function areaHa(img, band, sc) {
+  return img.rename(band).multiply(ee.Image.pixelArea())
+    .reduceRegion({reducer:ee.Reducer.sum(),geometry:AOI,scale:sc||10,maxPixels:1e10})
+    .get(band);
+}
+
+function lp(s,w){ s=String(s); while(s.length<w) s=s+' '; return s; }
+function rp(s,w){ s=String(s); while(s.length<w) s=' '+s; return s; }
+function fha(v)   { return v   ? (v/10000).toFixed(1)    : 'N/A'; }
+function fpct(v,d){ return (v&&d) ? (v/d*100).toFixed(1)+'%' : 'N/A'; }
+function frat(v,d){ return (v&&d) ? (v/d).toFixed(2)     : 'N/A'; }
+
+// =============================================================================
+// 8. POST-PROCESSING PIPELINE
+// =============================================================================
+
+function postProcess(rawFlood, name) {
+  var s0 = rawFlood.rename('flood');
+  countPx(s0, name+' raw');
+  var s1s = s0.focal_median(15,'circle','meters').focal_mode(30,'circle','meters');
+  var s2s = s1s.updateMask(flatMask);
+  var s3s = s2s.updateMask(vhTexture.lt(THR.texture_max));
+  var s4s = s3s.updateMask(nonVegMask);
+  var s5s = s4s.updateMask(nonRiverMask).gte(0.5).toInt().rename('flood');
+  var conn  = s5s.connectedPixelCount({maxSize:256, eightConnected:true});
+  var final = s5s.updateMask(conn.gte(THR.min_patch_px));
+  countPx(final, name+' final');
+  return final;
+}
+
+// =============================================================================
+// 9. OTSU THRESHOLDS
+// =============================================================================
+
+function otsu(histDict) {
+  var hist    = ee.Dictionary(histDict);
+  var counts  = ee.Array(hist.get('histogram'));
+  var means   = ee.Array(hist.get('bucketMeans'));
+  var mList   = ee.List(hist.get('bucketMeans'));
+  var size    = means.length().get([0]);
+  var total   = counts.reduce(ee.Reducer.sum(),[0]).get([0]);
+  var between = ee.List.sequence(1, size.subtract(1)).map(function(i){
+    i = ee.Number(i).toInt();
+    var aC = counts.slice(0,0,i), bC = counts.slice(0,i);
+    var aN = aC.reduce(ee.Reducer.sum(),[0]).get([0]);
+    var bN = bC.reduce(ee.Reducer.sum(),[0]).get([0]);
+    var aM = means.slice(0,0,i).multiply(aC).reduce(ee.Reducer.sum(),[0]).get([0]).divide(aN);
+    var bM = means.slice(0,i).multiply(bC).reduce(ee.Reducer.sum(),[0]).get([0]).divide(bN);
+    return aN.multiply(bN).multiply(aM.subtract(bM).pow(2)).divide(total.pow(2));
+  });
+  var mx = between.reduce(ee.Reducer.max());
+  return ee.Number(mList.get(between.indexOf(mx).add(1)));
+}
+
+// Otsu on VH change (used by A-VH, B-Otsu, C-MultiPol VH stack)
+var changeHist = vhChangeMean.reduceRegion({
+  reducer: ee.Reducer.histogram({maxBuckets:255, minBucketWidth:0.1}),
+  geometry:AOI, scale:30, maxPixels:1e10, bestEffort:true});
+var otsuChange = otsu(changeHist.get('VH_change_db'));
+
+// Otsu on VH flood magnitude (used for Stage 2 pseudo-labels)
+var floodHist  = vhFlood.reduceRegion({
+  reducer: ee.Reducer.histogram({maxBuckets:255, minBucketWidth:0.1}),
+  geometry:AOI, scale:30, maxPixels:1e10, bestEffort:true});
+var otsuVH     = otsu(floodHist.get('VH_flood'));
+
+// Otsu on VV change (used by B-VV, C-MultiPol VV stack)
+var changeHist_VV = vvChangeMean.reduceRegion({
+  reducer: ee.Reducer.histogram({maxBuckets:255, minBucketWidth:0.1}),
+  geometry:AOI, scale:30, maxPixels:1e10, bestEffort:true});
+var otsuChange_VV = otsu(changeHist_VV.get('VV_change_db'));
+
+// =============================================================================
+// 10. METHOD A-VH — PER-SCENE VH CHANGE DETECTION
+// =============================================================================
+
+var vhMaxRaw = s1FloodCol.map(function(img) {
+  img = img.clip(AOI);
+  var fLin = ee.Image(10).pow(img.select('VH').divide(10));
+  return fLin.divide(baseVHLin).log10().multiply(10).lt(THR.vh_db).rename('flood');
+}).max();
+
+var floodMap_VH = postProcess(vhMaxRaw, 'A-VH');
+
+// =============================================================================
+// 11. METHOD A-RATIO — PER-SCENE VV/VH RATIO CHANGE
+// (run for completeness; weaker performance noted in manuscript)
+// =============================================================================
+
+var ratioMaxRaw = s1FloodCol.map(function(img) {
+  img = img.clip(AOI);
+  var floodRatio = img.select('VV').subtract(img.select('VH'));
+  var baseRatio  = s1BaseMean.select('VV').subtract(s1BaseMean.select('VH'));
+  return floodRatio.subtract(baseRatio).lt(THR.ratio_db).rename('flood');
+}).max();
+
+var floodMap_Ratio = postProcess(ratioMaxRaw, 'A-Ratio');
+
+Map.addLayer(floodMap_VH.selfMask(),    {palette:['#2980b9']}, '2. A-VH Change',    true);
+Map.addLayer(floodMap_Ratio.selfMask(), {palette:['#1abc9c']}, '2. A-Ratio (ref only)', false);
+
+// =============================================================================
+// 12. METHOD B-OTSU — ADAPTIVE VH THRESHOLD
+// =============================================================================
+
+var otsuMaxRaw = changePerScene.map(function(img) {
+  return img.lt(otsuChange).rename('flood');
+}).max();
+
+var floodMap_Otsu = postProcess(otsuMaxRaw, 'B-Otsu');
+
+Map.addLayer(floodMap_Otsu.selfMask(), {palette:['#8e44ad']}, '3. B-Otsu', true);
+
+// =============================================================================
+// 13. METHOD B-VV — PER-SCENE VV CHANGE DETECTION
+// =============================================================================
+// VV backscatter drops over open water and rough-surface flood. Per-scene VV
+// change (dB) relative to the VV baseline; Otsu-thresholded on the mean VV
+// change image. VH texture mask retained for open-water discrimination
+// consistency across all methods.
+
+var vvMaxRaw = changePerScene_VV.map(function(img) {
+  return img.lt(otsuChange_VV).rename('flood');
+}).max();
+
+var floodMap_VV = postProcess(vvMaxRaw, 'B-VV');
+
+Map.addLayer(floodMap_VV.selfMask(), {palette:['#9b59b6']}, '3b. B-VV Change', true);
+
+otsuChange_VV.evaluate(function(v,e){
+  if(e){ print('  [VV Otsu ERROR] '+e); return; }
+  print('  Otsu VV change threshold: '+Number(v).toFixed(2)+' dB  (manual fallback: '+THR.vv_db+' dB)');
+});
+
+// =============================================================================
+// 14. METHOD C-MULTIPOL — MULTI-POLARISATION FREQUENCY FUSION
+// =============================================================================
+// Structural parallel to the S2+L8 optical validation approach:
+//
+//   Optical validation:
+//     S2/L8 scenes → per-image NDWI/MNDWI binary → flood frequency
+//     Threshold ≥ 0.5 → validated as flooded
+//
+//   Multi-pol fusion:
+//     VH scenes → per-scene Otsu binary  (changePerScene)
+//     VV scenes → per-scene Otsu binary  (changePerScene_VV)
+//     Merged stack → freq = flooded_count / (n_VH + n_VV scenes)
+//     Threshold ≥ THR.mp_freq_min (0.5) → classified as flooded
+//
+//   Frequency interpretation:
+//     Both polarisations, all scenes → freq ≈ 1.0
+//     Single-polarisation only (e.g. flooded veg in VH) → freq ≈ 0.5  (passes)
+//     Single-scene noise → max contribution ≈ 1/(2N) ≈ 0.1–0.17 (N≥3)
+
+var vhSceneStack = changePerScene.map(function(img) {
+  return img.lt(otsuChange).rename('flood_obs')
+    .copyProperties(img, ['system:time_start']);
+});
+
+var vvSceneStack = changePerScene_VV.map(function(img) {
+  return img.lt(otsuChange_VV).rename('flood_obs')
+    .copyProperties(img, ['system:time_start']);
+});
+
+var allPolStack = vhSceneStack.merge(vvSceneStack);
+var mpObs       = allPolStack.count().clip(AOI).rename('obs');
+var mpSum       = allPolStack.sum().clip(AOI).rename('sum');
+var mpFreq      = mpSum.divide(mpObs).rename('mp_freq');
+
+var mpRaw       = mpFreq.gte(THR.mp_freq_min)
+                    .updateMask(mpObs.gte(THR.min_obs))
+                    .toInt().rename('flood');
+var floodMap_MP = postProcess(mpRaw, 'C-MultiPol');
+
+Map.addLayer(mpFreq,
+  {min:0,max:1,palette:['white','#f9ca74','#c0392b']},
+  '4. C-MultiPol Frequency', false);
+Map.addLayer(floodMap_MP.selfMask(),
+  {palette:['#e74c3c']}, '4. C-MultiPol Map', true);
+
+mpObs.reduceRegion({
+  reducer:ee.Reducer.mean(), geometry:AOI, scale:30, maxPixels:1e10, bestEffort:true
+}).evaluate(function(d,e){
+  if(e||!d){ print('  [MultiPol obs ERROR] '+e); return; }
+  print('  MultiPol: mean obs/px = '+Number(d.obs).toFixed(1)+
+        ' (VV+VH scenes pooled) | freq threshold: '+THR.mp_freq_min);
+});
+
+// =============================================================================
+// 15. SEN1FLOODS11 LOADING — STAGE 1 & STAGE 2 RF
+// =============================================================================
+
+print('');
+print('═══════════════════════════════════════════════════════════════════════════');
+print('  FLOOD MAPPING & VALIDATION v15  |  Roumari Upazila  |  '+YEAR);
+print('  Methods: A-VH | B-VV | C-MultiPol | B-Otsu | C-RF-S11 | C-RF | D-Ens');
+print('  Loading Sen1Floods11 folders via listAssets...');
+print('═══════════════════════════════════════════════════════════════════════════');
+
+var S1_FOLDER  = 'projects/ee-2221128/assets/sen1floods11/S1Hand';
+var LBL_FOLDER = 'projects/ee-2221128/assets/sen1floods11/LabelHand';
+
+function chipStem(assetId) {
+  var name = assetId.split('/').pop();
+  name = name.replace(/_S1Hand$/, '');
+  name = name.replace(/_LabelHand$/, '');
+  return name;
+}
+
+ee.data.listAssets(S1_FOLDER, {}, function(s1List, s1Err) {
+  if (s1Err || !s1List || !s1List.assets || s1List.assets.length === 0) {
+    print('ERROR loading S1Hand folder: ' + s1Err);
+    return;
+  }
+
+  ee.data.listAssets(LBL_FOLDER, {}, function(lblList, lblErr) {
+    if (lblErr || !lblList || !lblList.assets || lblList.assets.length === 0) {
+      print('ERROR loading LabelHand folder: ' + lblErr);
+      return;
+    }
+
+    print('S1Hand chips found    : ' + s1List.assets.length);
+    print('LabelHand chips found : ' + lblList.assets.length);
+
+    var lblById = {};
+    lblList.assets.forEach(function(a) {
+      lblById[chipStem(a.id)] = a.id;
+    });
+
+    var matchedS1Ids  = [];
+    var matchedLblIds = [];
+    var skipped       = [];
+
+    s1List.assets.forEach(function(a) {
+      var stem = chipStem(a.id);
+      if (lblById[stem]) {
+        matchedS1Ids.push(a.id);
+        matchedLblIds.push(lblById[stem]);
+      } else {
+        skipped.push(stem);
+      }
+    });
+
+    print('Matched chip pairs    : ' + matchedS1Ids.length);
+    if (skipped.length > 0) {
+      print('WARNING — S1 chips with no label match: ' + skipped.join(', '));
+    }
+
+    if (matchedS1Ids.length === 0) {
+      print('ERROR: No matched chip pairs found. Check asset naming convention.');
+      return;
+    }
+
+    var chipImages = matchedS1Ids.map(function(s1Id, i) {
+      var s1img  = ee.Image(s1Id);
+      var lblImg = ee.Image(matchedLblIds[i]);
+
+      var vv = s1img.select([0]).rename('VV');
+      var vh = s1img.select([1]).rename('VH');
+
+      var ratio   = vv.subtract(vh).rename('VV_VH_ratio');
+      var vhLin   = ee.Image(10).pow(vh.divide(10));
+      var texture = vhLin.reduceNeighborhood({
+        reducer: ee.Reducer.variance(), kernel: ee.Kernel.square(1)
+      }).rename('VH_texture');
+
+      var rawLbl = lblImg.select([0]);
+      var lbl = rawLbl.rename('class')
+        .updateMask(rawLbl.eq(0).or(rawLbl.eq(1)));
+
+      return vv.addBands(vh).addBands(ratio).addBands(texture).addBands(lbl)
+        .set('chip_stem', chipStem(s1Id));
+    });
+
+    var s11_chipCol = ee.ImageCollection(chipImages);
+
+    var s11_allPts = s11_chipCol.map(function(chip) {
+      return ee.Image(chip).stratifiedSample({
+        numPoints:  THR.s11_px_per_chip,
+        classBand:  'class',
+        region:     ee.Image(chip).geometry(),
+        scale:      10,
+        seed:       42,
+        geometries: true
+      }).map(function(f) {
+        return f.set('chip_stem', chip.get('chip_stem'));
+      });
+    }).flatten();
+
+    s11_allPts.size().evaluate(function(n, e) {
+      print('Sen1Floods11 training pixels (all chips): ' + (e ? 'ERROR: '+e : n));
+    });
+
+    // ── Stage 1 classifier (all chips, probability mode) ────────────────────
+    var s11_clf = ee.Classifier.smileRandomForest({
+      numberOfTrees: RF_TREES, variablesPerSplit: 2,
+      minLeafPopulation: 5, seed: 42
+    }).setOutputMode('PROBABILITY')
+      .train({features: s11_allPts, classProperty: 'class', inputProperties: S11_FEAT});
+
+    var roumariS11Stack = vvFlood.rename('VV')
+      .addBands(vhFlood.rename('VH'))
+      .addBands(vvVhRatio.rename('VV_VH_ratio'))
+      .addBands(vhTexture.rename('VH_texture'))
+      .clip(AOI).unmask(THR.rf_fill);
+
+    var s11_prob_roumari = roumariS11Stack
+      .classify(s11_clf)
+      .updateMask(s1Mask)
+      .rename('s11_prob');
+
+    var s11_bin      = s11_prob_roumari.gte(THR.rf_prob).toInt().rename('flood');
+    var floodMap_S11 = postProcess(s11_bin, 'C-RF-S11(Stage1)');
+
+    Map.addLayer(s11_prob_roumari,
+      {min:0,max:1,palette:['white','#ffd580','#b35c00']}, '4a. C-RF-S11 Prob (Stage 1)', false);
+    Map.addLayer(floodMap_S11.selfMask(),
+      {palette:['#e67e22']}, '4a. C-RF-S11 Map (Stage 1)', false);
+
+    // ── Stage 1 feature importance ──────────────────────────────────────────
+    var s11_clfClass = ee.Classifier.smileRandomForest({
+      numberOfTrees: RF_TREES, variablesPerSplit: 2,
+      minLeafPopulation: 5, seed: 42
+    }).setOutputMode('CLASSIFICATION')
+      .train({features: s11_allPts, classProperty: 'class', inputProperties: S11_FEAT});
+
+    s11_clfClass.explain().evaluate(function(exp, err) {
+      if (err || !exp || !exp.importance) {
+        print('  [Stage 1 importance ERROR] ' + err); return;
+      }
+      var imp   = exp.importance;
+      var pairs = S11_FEAT.map(function(f){ return {f:f, v:imp[f]||0}; });
+      pairs.sort(function(a,b){ return b.v-a.v; });
+      var tot = pairs.reduce(function(s,p){ return s+p.v; },0);
+      print('');
+      print('  ── STAGE 1 (Sen1Floods11) FEATURE IMPORTANCE ────────────────────────');
+      pairs.forEach(function(p){
+        var pct = tot>0 ? (p.v/tot*100).toFixed(1) : '0.0';
+        var bar = ''; var bl = Math.round(p.v/tot*30);
+        for(var i=0;i<bl;i++) bar+='█';
+        for(var j=bl;j<30;j++) bar+='░';
+        print('  '+lp(p.f,20)+lp(pct+'%',10)+bar);
+      });
+    });
+
+    // ── Serialized cross-chip leave-one-out CV ──────────────────────────────
+    print('');
+    print('  ── SEN1FLOODS11 CROSS-CHIP CV (leave-one-chip-out) — SERIALIZED ────────');
+    print('  One chip withheld per fold. Remaining chips train Stage 1 RF.');
+
+    var allStems = matchedS1Ids.map(function(id){ return chipStem(id); });
+    var nChips   = allStems.length;
+    print('  Total chips: ' + nChips + ' | Running ' + nChips + '-fold CV (one fold at a time)...');
+
+    var cvTP = 0, cvTN = 0, cvFP = 0, cvFN = 0;
+
+    function printCVAggregate() {
+      var tot2 = cvTP+cvTN+cvFP+cvFN;
+      if (tot2 === 0) { print('  [CV aggregate ERROR] No valid fold results.'); return; }
+      var OA   = (cvTP+cvTN)/tot2;
+      var PA   = cvTP/(cvTP+cvFN);
+      var UA   = (cvTP+cvFP)>0 ? cvTP/(cvTP+cvFP) : 0;
+      var spec = (cvTN+cvFP)>0 ? cvTN/(cvTN+cvFP) : 0;
+      var BA   = (PA+spec)/2;
+      var F1   = (2*cvTP+cvFP+cvFN)>0 ? 2*cvTP/(2*cvTP+cvFP+cvFN) : 0;
+      var CSI  = (cvTP+cvFP+cvFN)>0 ? cvTP/(cvTP+cvFP+cvFN) : 0;
+      var pe   = ((cvTP+cvFP)*(cvTP+cvFN)+(cvTN+cvFN)*(cvTN+cvFP))/(tot2*tot2);
+      var kap  = (OA-pe)/(1-pe);
+      print('');
+      print('  ── AGGREGATE CROSS-CHIP CV RESULTS ──────────────────────────────────');
+      print('  n='+tot2+' | TP='+cvTP+' TN='+cvTN+' FP='+cvFP+' FN='+cvFN);
+      print('  OA='+(OA*100).toFixed(1)+'%  BA='+(BA*100).toFixed(1)+'%'+
+            '  PA='+(PA*100).toFixed(1)+'%  UA='+(UA*100).toFixed(1)+'%');
+      print('  F1='+(F1*100).toFixed(1)+'%  CSI='+(CSI*100).toFixed(1)+'%'+
+            '  κ='+kap.toFixed(3));
+      print('  NOTE: All-land chips (no flood pixels) excluded from fold metrics.');
+      print('  Interpretation: κ measures S1-only RF generalisation across India chips.');
+      runStage2();
+    }
+
+    function cvFoldStep(foldIdx) {
+      if (foldIdx >= nChips) {
+        printCVAggregate();
+        return;
+      }
+
+      var holdoutStem = allStems[foldIdx];
+      var trnPts = s11_allPts.filter(ee.Filter.neq('chip_stem', holdoutStem));
+      var valPts = s11_allPts.filter(ee.Filter.eq('chip_stem',  holdoutStem));
+
+      var clfK = ee.Classifier.smileRandomForest({
+        numberOfTrees: RF_TREES, variablesPerSplit: 2,
+        minLeafPopulation: 5, seed: 42
+      }).setOutputMode('PROBABILITY')
+        .train({features: trnPts, classProperty: 'class', inputProperties: S11_FEAT});
+
+      valPts.classify(clfK, 'prob')
+        .map(function(f){
+          var pred = ee.Number(f.get('prob')).gte(THR.rf_prob).toInt();
+          var act  = ee.Number(f.get('class'));
+          return f.set({
+            TP: pred.eq(1).and(act.eq(1)).toInt(),
+            TN: pred.eq(0).and(act.eq(0)).toInt(),
+            FP: pred.eq(1).and(act.eq(0)).toInt(),
+            FN: pred.eq(0).and(act.eq(1)).toInt()
+          });
+        })
+        .evaluate(function(fc, ferr) {
+          if (ferr || !fc) {
+            print('  [CV fold ERROR] Chip '+holdoutStem+': '+ferr);
+            cvFoldStep(foldIdx + 1);
+            return;
+          }
+
+          var fTP=0,fTN=0,fFP=0,fFN=0;
+          fc.features.forEach(function(f){
+            fTP += f.properties.TP||0;
+            fTN += f.properties.TN||0;
+            fFP += f.properties.FP||0;
+            fFN += f.properties.FN||0;
+          });
+          var tot = fTP+fTN+fFP+fFN;
+
+          if ((fTP + fFN) === 0) {
+            print('  Fold '+(foldIdx+1)+'/'+nChips+' (held: '+holdoutStem+
+                  ') | SKIPPED — no flood pixels in holdout chip');
+            cvFoldStep(foldIdx + 1);
+            return;
+          }
+
+          var pa  = (fTP/(fTP+fFN)*100).toFixed(1);
+          var ua  = (fTP+fFP)>0 ? (fTP/(fTP+fFP)*100).toFixed(1) : '0.0';
+          var f1  = (2*fTP+fFP+fFN)>0 ? (2*fTP/(2*fTP+fFP+fFN)*100).toFixed(1) : '0.0';
+          print('  Fold '+(foldIdx+1)+'/'+nChips+' (held: '+holdoutStem+')'+
+                ' | n='+tot+' | PA='+pa+'% UA='+ua+'% F1='+f1+'%');
+
+          cvTP += fTP; cvTN += fTN; cvFP += fFP; cvFN += fFN;
+          cvFoldStep(foldIdx + 1);
+        });
+    }
+
+    cvFoldStep(0);
+
+    // =========================================================================
+    // STAGE 2 + ALL DOWNSTREAM  (called from printCVAggregate)
+    // =========================================================================
+
+    function runStage2() {
+
+      var featureStack = featureStackBase
+        .addBands(s11_prob_roumari.unmask(THR.rf_fill))
+        .clip(AOI);
+
+      var sarWater = vhFlood.lt(otsuVH.subtract(THR.rf_water_m))
+        .and(vhTexture.lt(THR.texture_max))
+        .updateMask(nonRiverMask).rename('class');
+
+      var sarLand = vhFlood.gt(otsuVH.add(THR.rf_land_m))
+        .updateMask(nonRiverMask).rename('class');
+
+      // ── Spatial CV blocks ─────────────────────────────────────────────────
+      var bounds = AOI.bounds();
+      var coords = ee.List(bounds.coordinates().get(0));
+      var xMin   = ee.Number(ee.List(coords.get(0)).get(0));
+      var yMin   = ee.Number(ee.List(coords.get(0)).get(1));
+      var xMax   = ee.Number(ee.List(coords.get(2)).get(0));
+      var yMax   = ee.Number(ee.List(coords.get(2)).get(1));
+      var xStep  = xMax.subtract(xMin).divide(CV_COLS);
+      var yStep  = yMax.subtract(yMin).divide(CV_ROWS);
+
+      var blocks = [];
+      for (var r=0; r<CV_ROWS; r++) {
+        for (var c=0; c<CV_COLS; c++) {
+          blocks.push(ee.Feature(ee.Geometry.Rectangle([
+            xMin.add(xStep.multiply(c)),   yMin.add(yStep.multiply(r)),
+            xMin.add(xStep.multiply(c+1)), yMin.add(yStep.multiply(r+1))
+          ]), {fold: r*CV_COLS+c}));
+        }
+      }
+      var blockFC   = ee.FeatureCollection(blocks);
+      var foldImage = ee.Image(0).paint(blockFC,'fold').rename('fold').clip(AOI);
+
+      Map.addLayer(blockFC, {color:'orange'}, '0. CV Blocks', false);
+
+      var wPts = sarWater.selfMask().addBands(foldImage).addBands(featureStack)
+        .stratifiedSample({numPoints:600, classBand:'class',
+          region:AOI, scale:30, seed:42, geometries:true})
+        .map(function(f){ return f.set('class',1); });
+
+      var lPts = sarLand.selfMask().addBands(foldImage).addBands(featureStack)
+        .stratifiedSample({numPoints:600, classBand:'class',
+          region:AOI, scale:30, seed:43, geometries:true})
+        .map(function(f){ return f.set('class',0); });
+
+      var allPts = wPts.merge(lPts);
+
+      print('');
+      print('  ── STAGE 2 LOCAL RF — SPATIAL BLOCK CV ('+CV_ROWS+'×'+CV_COLS+' folds) ─────────────');
+
+      var nFolds  = CV_ROWS * CV_COLS;
+      var cvFolds = [];
+
+      for (var k=0; k<nFolds; k++) {
+        var trnK = allPts.filter(ee.Filter.neq('fold', k));
+        var valK = allPts.filter(ee.Filter.eq('fold',  k));
+        var clfK2 = ee.Classifier.smileRandomForest({
+          numberOfTrees:RF_TREES, variablesPerSplit:3, minLeafPopulation:5, seed:42
+        }).setOutputMode('PROBABILITY')
+          .train({features:trnK, classProperty:'class', inputProperties:RF_FEAT});
+        cvFolds.push(
+          valK.classify(clfK2,'prob').map(function(f){
+            return f.set('predicted', ee.Number(f.get('prob')).gte(THR.rf_prob).toInt());
+          })
+        );
+      }
+
+      var cvAll = cvFolds[0];
+      for (var k2=1; k2<nFolds; k2++) { cvAll = cvAll.merge(cvFolds[k2]); }
+
+      var cvLabelled = cvAll.map(function(f){
+        var pred = ee.Number(f.get('predicted'));
+        var act  = ee.Number(f.get('class'));
+        return f.set({
+          TP: pred.eq(1).and(act.eq(1)).toInt(),
+          TN: pred.eq(0).and(act.eq(0)).toInt(),
+          FP: pred.eq(1).and(act.eq(0)).toInt(),
+          FN: pred.eq(0).and(act.eq(1)).toInt()
+        });
+      });
+
+      ee.Dictionary({
+        TP: cvLabelled.aggregate_sum('TP'), TN: cvLabelled.aggregate_sum('TN'),
+        FP: cvLabelled.aggregate_sum('FP'), FN: cvLabelled.aggregate_sum('FN')
+      }).evaluate(function(cv, err){
+        if(err||!cv){ print('  [Stage 2 CV ERROR] '+err); return; }
+        var TP=cv.TP,TN=cv.TN,FP=cv.FP,FN=cv.FN,tot=TP+TN+FP+FN;
+        var OA=(TP+TN)/tot, PA=TP/(TP+FN), UA=TP/(TP+FP);
+        var F1=2*TP/(2*TP+FP+FN), CSI=TP/(TP+FP+FN);
+        var pe=((TP+FP)*(TP+FN)+(TN+FN)*(TN+FP))/(tot*tot);
+        var kap=(OA-pe)/(1-pe);
+        print('');
+        print('  ── STAGE 2 SPATIAL BLOCK CV RESULTS ('+CV_ROWS+'×'+CV_COLS+' folds) ──────────────');
+        print('  Labels: SAR-native Otsu. Features: SAR + terrain + JRC + s11_prob.');
+        print('  n='+tot+' | TP='+TP+' TN='+TN+' FP='+FP+' FN='+FN);
+        print('  OA='+(OA*100).toFixed(1)+'%  PA='+(PA*100).toFixed(1)+
+              '%  UA='+(UA*100).toFixed(1)+'%');
+        print('  F1='+(F1*100).toFixed(1)+'%  CSI='+(CSI*100).toFixed(1)+
+              '%  κ='+kap.toFixed(3));
+        print('  NOTE: Near-perfect κ is EXPECTED — labels are SAR-Otsu-derived');
+        print('  "easy" pixels (±2 dB margin from threshold). This CV tests');
+        print('  within-distribution label consistency, NOT real-world flood');
+        print('  detection accuracy. Independent accuracy is reported in Sec 6a/6b.');
+      });
+
+      // ── Final Stage 2 classifiers ─────────────────────────────────────────
+      var rfClf = ee.Classifier.smileRandomForest({
+        numberOfTrees:RF_TREES, variablesPerSplit:3, minLeafPopulation:5, seed:42
+      }).setOutputMode('PROBABILITY')
+        .train({features:allPts, classProperty:'class', inputProperties:RF_FEAT});
+
+      var rfClfClass = ee.Classifier.smileRandomForest({
+        numberOfTrees:RF_TREES, variablesPerSplit:3, minLeafPopulation:5, seed:42
+      }).setOutputMode('CLASSIFICATION')
+        .train({features:allPts, classProperty:'class', inputProperties:RF_FEAT});
+
+      rfClfClass.explain().evaluate(function(exp, err) {
+        if (err || !exp || !exp.importance) {
+          print('  [Stage 2 importance ERROR] ' + err); return;
+        }
+        var imp   = exp.importance;
+        var pairs = RF_FEAT.map(function(f){ return {feature:f, importance:imp[f]||0}; });
+        pairs.sort(function(a,b){ return b.importance-a.importance; });
+        var total = pairs.reduce(function(s,p){ return s+p.importance; },0);
+        print('');
+        print('  ── STAGE 2 (Local RF) FEATURE IMPORTANCE ────────────────────────────');
+        pairs.forEach(function(p){
+          var norm = total>0 ? p.importance/total : 0;
+          var pct  = (norm*100).toFixed(1);
+          var bl   = Math.round(norm*30);
+          var bar  = '';
+          for(var i=0;i<bl;i++) bar+='█';
+          for(var j=bl;j<30;j++) bar+='░';
+          var note = p.feature==='s11_prob' ? ' ← Sen1Floods11 contribution' : '';
+          print('  '+lp(p.feature,22)+lp(pct+'%',12)+bar+note);
+        });
+      });
+
+      var rfProb = featureStack.classify(rfClf).updateMask(s1Mask).rename('rf_prob');
+
+      rfProb.reduceRegion({
+        reducer: ee.Reducer.percentile([10,25,50,75,90]),
+        geometry:AOI, scale:30, maxPixels:1e10, bestEffort:true
+      }).evaluate(function(d,e){
+        if(e||!d){ print('  [RF prob ERROR] '+e); return; }
+        print('  p10='+Number(d.rf_prob_p10).toFixed(2)+
+              '  p25='+Number(d.rf_prob_p25).toFixed(2)+
+              '  p50='+Number(d.rf_prob_p50).toFixed(2)+
+              '  p75='+Number(d.rf_prob_p75).toFixed(2)+
+              '  p90='+Number(d.rf_prob_p90).toFixed(2));
+      });
+
+      var rfBin   = rfProb.gte(THR.rf_prob).toInt().rename('flood');
+      var rfMorph = rfBin.focal_median(15,'circle','meters').focal_mode(30,'circle','meters');
+      var rfMskd  = rfMorph.updateMask(flatMask).updateMask(nonVegMask).updateMask(nonRiverMask)
+        .gte(0.5).toInt().rename('flood');
+      var rfConn  = rfMskd.connectedPixelCount({maxSize:256, eightConnected:true});
+      var floodMap_RF = rfMskd.updateMask(rfConn.gte(THR.min_patch_px));
+
+      countPx(rfProb.gte(THR.rf_prob).rename('f'), 'C-RF(Stage2) raw');
+      countPx(floodMap_RF, 'C-RF(Stage2) final');
+
+      Map.addLayer(rfProb,
+        {min:0,max:1,palette:['white','#a9d18e','#375623']}, '4b. C-RF Prob (Stage 2)', false);
+      Map.addLayer(floodMap_RF.selfMask(),
+        {palette:['#27ae60']}, '4b. C-RF Map (Stage 2)', true);
+
+      // ── Method D — Ensemble (run for reference; not a manuscript method) ──
+      var voteSum  = floodMap_VH.unmask(0).add(floodMap_Otsu.unmask(0)).add(floodMap_RF.unmask(0));
+      var ensRaw   = voteSum.gte(2).updateMask(nonRiverMask).toInt().rename('flood');
+      var ensConn  = ensRaw.connectedPixelCount({maxSize:256, eightConnected:true});
+      var floodMap_Ens = ensRaw.updateMask(ensConn.gte(THR.min_patch_px));
+
+      countPx(floodMap_Ens, 'D-Ensemble final');
+      Map.addLayer(floodMap_Ens.selfMask(), {palette:['#e91e8c']}, '5. D-Ensemble (ref only)', true);
+
+      // ── Optical References ────────────────────────────────────────────────
+      function maskL8(img){
+        var qa=img.select('QA_PIXEL');
+        return img.updateMask(qa.bitwiseAnd(1<<3).eq(0).and(qa.bitwiseAnd(1<<4).eq(0)));
+      }
+
+      var s2Ext = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterBounds(AOI).filterDate(DATE.opt_ext_start, DATE.opt_ext_end)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', THR.max_cloud_s2))
+        .select(['B3','B8','B11','SCL'])
+        .map(function(img){ return img.clip(AOI); });
+
+      var s2WaterExt = s2Ext.map(maskS2Clouds).map(function(img){
+        return img.normalizedDifference(['B3','B8']).gt(THR.ndwi)
+          .or(img.normalizedDifference(['B3','B11']).gt(THR.mndwi))
+          .rename('water');
+      });
+
+      var l8Ext = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+        .filterBounds(AOI).filterDate(DATE.opt_ext_start, DATE.opt_ext_end)
+        .filter(ee.Filter.lt('CLOUD_COVER', THR.max_cloud_l8))
+        .select(['SR_B3','SR_B5','SR_B6','QA_PIXEL'])
+        .map(function(img){ return img.clip(AOI); });
+
+      var l8WaterExt = l8Ext.map(maskL8).map(function(img){
+        var g=img.select('SR_B3').multiply(0.0000275).add(-0.2);
+        var n=img.select('SR_B5').multiply(0.0000275).add(-0.2);
+        var s=img.select('SR_B6').multiply(0.0000275).add(-0.2);
+        return g.subtract(n).divide(g.add(n)).gt(THR.ndwi)
+          .or(g.subtract(s).divide(g.add(s)).gt(THR.mndwi)).rename('water');
+      });
+
+      var allOptExt  = s2WaterExt.merge(l8WaterExt);
+      var obsExt     = allOptExt.count().clip(AOI).rename('obs');
+      var freqExt    = allOptExt.sum().divide(obsExt);
+      var refMaskExt = obsExt.gte(THR.min_obs).and(nonRiverMask);
+      var wMaxExt    = allOptExt.max().updateMask(refMaskExt).rename('water_max');
+
+      var s2Res = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterBounds(AOI).filterDate(DATE.opt_res_start, DATE.opt_res_end)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', THR.max_cloud_s2))
+        .select(['B3','B8','B11','SCL'])
+        .map(function(img){ return img.clip(AOI); });
+
+      var s2WaterRes = s2Res.map(maskS2Clouds).map(function(img){
+        return img.normalizedDifference(['B3','B8']).gt(THR.ndwi)
+          .or(img.normalizedDifference(['B3','B11']).gt(THR.mndwi)).rename('water');
+      });
+
+      var l8Res = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+        .filterBounds(AOI).filterDate(DATE.opt_res_start, DATE.opt_res_end)
+        .filter(ee.Filter.lt('CLOUD_COVER', THR.max_cloud_l8))
+        .select(['SR_B3','SR_B5','SR_B6','QA_PIXEL'])
+        .map(function(img){ return img.clip(AOI); });
+
+      var l8WaterRes = l8Res.map(maskL8).map(function(img){
+        var g=img.select('SR_B3').multiply(0.0000275).add(-0.2);
+        var n=img.select('SR_B5').multiply(0.0000275).add(-0.2);
+        var s=img.select('SR_B6').multiply(0.0000275).add(-0.2);
+        return g.subtract(n).divide(g.add(n)).gt(THR.ndwi)
+          .or(g.subtract(s).divide(g.add(s)).gt(THR.mndwi)).rename('water');
+      });
+
+      var allOptRes  = s2WaterRes.merge(l8WaterRes);
+      var obsRes     = allOptRes.count().clip(AOI).rename('obs');
+      var freqRes    = allOptRes.sum().divide(obsRes);
+      var refMaskRes = obsRes.gte(THR.min_obs).and(nonRiverMask);
+      var wMaxRes    = allOptRes.max().updateMask(refMaskRes).rename('water_max');
+
+      function maskMODIS(img){
+        return img.updateMask(img.select('state_1km').bitwiseAnd(3).eq(0));
+      }
+      var modisCol = ee.ImageCollection('MODIS/061/MOD09GA')
+        .filterBounds(AOI).filterDate(DATE.opt_ext_start, DATE.opt_ext_end)
+        .select(['sur_refl_b04','sur_refl_b02','sur_refl_b06','state_1km'])
+        .map(function(img){ return img.clip(AOI); });
+      var modisWater = modisCol.map(maskMODIS).map(function(img){
+        var g=img.select('sur_refl_b04').multiply(0.0001);
+        var n=img.select('sur_refl_b02').multiply(0.0001);
+        var s=img.select('sur_refl_b06').multiply(0.0001);
+        return g.subtract(n).divide(g.add(n)).gt(THR.ndwi)
+          .or(g.subtract(s).divide(g.add(s)).gt(THR.mndwi)).rename('water');
+      });
+      var modisObs = modisWater.count().clip(AOI).rename('obs');
+      var modisMax = modisWater.max().updateMask(modisObs.gte(THR.min_obs)).rename('wm');
+
+      Map.addLayer(freqExt, {min:0,max:1,palette:['#f5e642','#27b0e6','#0a4e9e']},
+        '0. S2+L8 Freq (Extended)', false);
+      Map.addLayer(wMaxExt.selfMask(), {palette:['#1a3a8a']}, '0. S2+L8 Max Ext', false);
+      Map.addLayer(wMaxRes.selfMask(), {palette:['#2874a6']}, '0. S2+L8 Max Res', false);
+
+      // ── Validation Points ─────────────────────────────────────────────────
+      function makePts(wMask, lMask, nW, nL, sW, sL, strat) {
+        var wP = wMask.selfMask().stratifiedSample({
+          numPoints:nW, classBand:wMask.bandNames().get(0),
+          region:AOI, scale:30, seed:sW, geometries:true
+        }).map(function(f){ return f.set({class:1, strategy:strat}); });
+        var lP = lMask.selfMask().stratifiedSample({
+          numPoints:nL, classBand:lMask.bandNames().get(0),
+          region:AOI, scale:30, seed:sL, geometries:true
+        }).map(function(f){ return f.set({class:0, strategy:strat}); });
+        return wP.merge(lP);
+      }
+
+      var w50e = freqExt.gte(0.5).updateMask(refMaskExt);
+      var l50e = freqExt.lt(0.3).updateMask(refMaskExt);
+      var vPts50e  = makePts(w50e, l50e, 100, 100, 60, 61, 'ext50');
+
+      var w60e = freqExt.gte(0.6).updateMask(refMaskExt);
+      var l60e = freqExt.lt(0.2).updateMask(refMaskExt);
+      var vPts60e  = makePts(w60e, l60e, 100, 100, 62, 63, 'ext60');
+
+      var vPtsMaxE = makePts(wMaxExt.eq(1), wMaxExt.eq(0), 100, 100, 64, 65, 'extMax');
+      var vPtsCrop = makePts(w50e.and(cropMask), l50e.and(cropMask), 50, 50, 66, 67, 'crop');
+
+      var w50r = freqRes.gte(0.5).updateMask(refMaskRes);
+      var l50r = freqRes.lt(0.3).updateMask(refMaskRes);
+      var vPts50r  = makePts(w50r, l50r, 100, 100, 70, 71, 'res50');
+      var vPtsMaxR = makePts(wMaxRes.eq(1), wMaxRes.eq(0), 100, 100, 72, 73, 'resMax');
+
+      Map.addLayer(w50e.selfMask(), {palette:['#1565c0']}, '0. Val Water 50% Ext', false);
+      Map.addLayer(l50e.selfMask(), {palette:['#7b4f28']}, '0. Val Land  50% Ext', false);
+
+      // ── Console Sections 2–5 ──────────────────────────────────────────────
+      ee.Dictionary({
+        s1b:  s1BaseCol.size(),  s1f:  s1FloodCol.size(),
+        s2e:  s2Ext.size(),      s2r:  s2Res.size(),      s2p: s2Pre.size(),
+        l8e:  l8Ext.size(),      l8r:  l8Res.size(),       mod: modisCol.size(),
+        obsE_mn: obsExt.reduceRegion({reducer:ee.Reducer.mean(),geometry:AOI,scale:30,maxPixels:1e10}).get('obs'),
+        obsE_mi: obsExt.reduceRegion({reducer:ee.Reducer.min(), geometry:AOI,scale:30,maxPixels:1e10}).get('obs'),
+        obsE_mx: obsExt.reduceRegion({reducer:ee.Reducer.max(), geometry:AOI,scale:30,maxPixels:1e10}).get('obs'),
+        obsR_mn: obsRes.reduceRegion({reducer:ee.Reducer.mean(),geometry:AOI,scale:30,maxPixels:1e10}).get('obs'),
+        oC: otsuChange, oVH: otsuVH, oVV: otsuChange_VV
+      }).evaluate(function(c,e){
+        if(e||!c){ print('ERROR sec2: '+e); return; }
+        print('');
+        print('  2. IMAGE COUNTS & THRESHOLDS');
+        print('  S1: '+c.s1b+' baseline | '+c.s1f+' flood scenes (ASC, IW)');
+        print('  S2: ext='+c.s2e+' res='+c.s2r+' pre='+c.s2p+
+              ' | L8: ext='+c.l8e+' res='+c.l8r+' | MODIS: '+c.mod);
+        print('  Optical obs/px — Extended : mean='+Number(c.obsE_mn).toFixed(1)+
+              '  min='+c.obsE_mi+'  max='+c.obsE_mx);
+        print('  Optical obs/px — Restricted: mean='+Number(c.obsR_mn).toFixed(1));
+        print('  Otsu VH change threshold : '+Number(c.oC).toFixed(2)+' dB'+
+              '  (manual: '+THR.vh_db+' dB)');
+        print('  Otsu VH flood (Stage 2 labels): '+Number(c.oVH).toFixed(2)+' dB');
+        print('  Otsu VV change threshold : '+Number(c.oVV).toFixed(2)+' dB'+
+              '  (manual: '+THR.vv_db+' dB)');
+        print('  MultiPol freq threshold  : '+THR.mp_freq_min+
+              '  (VV+VH scenes pooled, mirrors S2+L8 50% persistence)');
+        print('  Stage 2 water label: VH < '+(Number(c.oVH)-THR.rf_water_m).toFixed(2)+'  AND low texture');
+        print('  Stage 2 land  label: VH > '+(Number(c.oVH)+THR.rf_land_m).toFixed(2));
+        print('  Stage 1 (Sen1Floods11): trained on '+matchedS1Ids.length+' India chip pairs');
+      });
+
+      ee.Dictionary({
+        study: ee.Image(1).rename('a').multiply(ee.Image.pixelArea())
+          .reduceRegion({reducer:ee.Reducer.sum(),geometry:AOI,scale:30,maxPixels:1e10}).get('a'),
+        crop:  areaHa(cropMask,                          'cropland'),
+        river: areaHa(riverSmooth.gt(0),                 'river',30),
+        vh:    areaHa(floodMap_VH,                       'flood'),
+        vh_c:  areaHa(floodMap_VH.and(cropMask),         'flood'),
+        ra:    areaHa(floodMap_Ratio,                    'flood'),
+        ra_c:  areaHa(floodMap_Ratio.and(cropMask),      'flood'),
+        ot:    areaHa(floodMap_Otsu,                     'flood'),
+        ot_c:  areaHa(floodMap_Otsu.and(cropMask),       'flood'),
+        s11:   areaHa(floodMap_S11,                      'flood'),
+        s11_c: areaHa(floodMap_S11.and(cropMask),        'flood'),
+        rf:    areaHa(floodMap_RF,                       'flood'),
+        rf_c:  areaHa(floodMap_RF.and(cropMask),         'flood'),
+        en:    areaHa(floodMap_Ens,                      'flood'),
+        en_c:  areaHa(floodMap_Ens.and(cropMask),        'flood'),
+        vv:    areaHa(floodMap_VV,                       'flood'),
+        vv_c:  areaHa(floodMap_VV.and(cropMask),         'flood'),
+        mp:    areaHa(floodMap_MP,                       'flood'),
+        mp_c:  areaHa(floodMap_MP.and(cropMask),         'flood'),
+        gfm:   areaHa(gfmSmoothed,                      'gfm_flood'),
+        gfm_c: areaHa(gfmSmoothed.and(cropMask),         'gfm_flood'),
+        s2e:   areaHa(wMaxExt,                           'water_max',30),
+        s2r:   areaHa(wMaxRes,                           'water_max',30),
+        mod:   areaHa(modisMax,                          'wm',500)
+      }).evaluate(function(a,e){
+        if(e||!a){ print('ERROR sec3: '+e); return; }
+        var gfm=a.gfm, crop=a.crop;
+        print('');
+        print('  3. STUDY AREA');
+        print('  Total : '+fha(a.study)+' ha');
+        print('  Crop  : '+fha(crop)+' ha ('+fpct(crop,a.study)+')');
+        print('  Rivers: '+fha(a.river)+' ha (JRC-masked, excluded from all flood maps)');
+        print('');
+        print('  4. REFERENCE EXTENTS');
+        print('  S2+L8 Extended  (ext window)    : '+fha(a.s2e)+' ha');
+        print('  S2+L8 Restricted (flood window) : '+fha(a.s2r)+' ha');
+        print('  MODIS (500m, ext window)        : '+fha(a.mod)+' ha');
+        print('  GFM operational product         : '+fha(gfm)+' ha');
+        print('');
+        print('  5. FLOOD EXTENT (per-scene max extent)');
+        print('  '+lp('Method',25)+lp('Flood ha',10)+lp('Crop ha',10)+lp('% crop',10)+'vs GFM');
+        print('  '+lp('─',62));
+        // Main manuscript methods first, then reference-only methods
+        [['A. VH Change',        a.vh,  a.vh_c],
+         ['B. VV Change',        a.vv,  a.vv_c],
+         ['C. Multi-Pol Fusion', a.mp,  a.mp_c],
+         ['B. Otsu (VH)',        a.ot,  a.ot_c],
+         ['C-S11 (Stage 1)',     a.s11, a.s11_c],
+         ['C-RF  (Stage 2)',     a.rf,  a.rf_c],
+         ['--- ref only ---',    null,  null],
+         ['A. VV/VH Ratio',      a.ra,  a.ra_c],
+         ['D. Ensemble',         a.en,  a.en_c],
+         ['GFM',                 a.gfm, a.gfm_c]
+        ].forEach(function(row){
+          if(!row[1]){ print('  '+lp(row[0],62)); return; }
+          print('  '+lp(row[0],25)+lp(fha(row[1]),10)+lp(fha(row[2]),10)+
+                lp(fpct(row[2],crop),10)+frat(row[1],gfm));
+        });
+        print('  VH/GFM = '+frat(a.vh, gfm)+(a.vh/gfm>1.2?' ⚠ over':' ✓'));
+        print('  VV/GFM = '+frat(a.vv, gfm)+(a.vv/gfm>1.2?' ⚠ over':a.vv/gfm<0.8?' ⚠ under':' ✓'));
+        print('  MP/GFM = '+frat(a.mp, gfm)+(a.mp/gfm>1.2?' ⚠ over':a.mp/gfm<0.8?' ⚠ under':' ✓'));
+      });
+
+      ee.Dictionary({
+        n50e:vPts50e.size(), n60e:vPts60e.size(), nme:vPtsMaxE.size(), ncrp:vPtsCrop.size(),
+        n50r:vPts50r.size(), nmr:vPtsMaxR.size()
+      }).evaluate(function(n,e){
+        if(e||!n){ print('ERROR val pts: '+e); return; }
+        print('');
+        print('  VALIDATION POINTS');
+        print('  Extended  window: 50%='+n.n50e+' | 60%='+n.n60e+
+              ' | max='+n.nme+' | crop='+n.ncrp);
+        print('  Restricted window: 50%='+n.n50r+' | max='+n.nmr);
+        print('  Stage 1 RF labels: Sen1Floods11 hand labels ('+matchedS1Ids.length+' chips).');
+        print('  Stage 2 RF labels: SAR-native Otsu.');
+      });
+
+      // ── Accuracy metric function ──────────────────────────────────────────
+      function calcMetrics(floodMap, valPts, label) {
+        var sampledMap = floodMap.rename('flood').unmask(0);
+        var cm = sampledMap.sampleRegions({
+          collection: valPts, scale: 30, tileScale: 4, geometries: false
+        }).map(function(f){
+          var pred = ee.Number(f.get('flood')).round();
+          var act  = ee.Number(f.get('class'));
+          return f.set({
+            TP: pred.eq(1).and(act.eq(1)).toInt(),
+            TN: pred.eq(0).and(act.eq(0)).toInt(),
+            FP: pred.eq(1).and(act.eq(0)).toInt(),
+            FN: pred.eq(0).and(act.eq(1)).toInt()
+          });
+        });
+
+        var TP  = ee.Number(cm.aggregate_sum('TP'));
+        var TN  = ee.Number(cm.aggregate_sum('TN'));
+        var FP  = ee.Number(cm.aggregate_sum('FP'));
+        var FN  = ee.Number(cm.aggregate_sum('FN'));
+        var tot = TP.add(TN).add(FP).add(FN);
+        var OA  = TP.add(TN).divide(tot);
+        var PA  = TP.divide(TP.add(FN));
+        var UA  = TP.divide(TP.add(FP));
+        var specLand = TN.divide(TN.add(FP));
+        var BA  = PA.add(specLand).divide(2);
+        var F1  = TP.multiply(2).divide(TP.multiply(2).add(FP).add(FN));
+        var CSI = TP.divide(TP.add(FP).add(FN));
+        var pe  = TP.add(FP).multiply(TP.add(FN))
+                    .add(TN.add(FN).multiply(TN.add(FP)))
+                    .divide(tot.pow(2));
+        var kap = OA.subtract(pe).divide(ee.Number(1).subtract(pe));
+
+        return ee.Dictionary({
+          label:label, TP:TP, TN:TN, FP:FP, FN:FN,
+          OA:OA, BA:BA, PA:PA, UA:UA, F1:F1, CSI:CSI, Kappa:kap, total:tot
+        });
+      }
+
+      var hdr = '  '+lp('Method',16)+'| '+lp('Validation set',17)+'| '+
+        rp('n',4)+' '+rp('TP',4)+' '+rp('TN',4)+' '+rp('FP',4)+' '+rp('FN',4)+' | '+
+        rp('BA',7)+' '+rp('PA',7)+' '+rp('UA',7)+' | '+
+        rp('F1',7)+' '+rp('CSI',7)+' '+rp('κ',6);
+      var div = '  '+Array(116).join('-');
+
+      function rowFmt(m){
+        if(!m){ print('  [row error]'); return; }
+        var p  = m.label.split('|');
+        var pc = function(v){ return rp((!v&&v!==0)||isNaN(v)?'N/A':(v*100).toFixed(1)+'%',7); };
+        var kf = function(v){ return rp((!v&&v!==0)||isNaN(v)?'N/A':v.toFixed(3),6); };
+        var n  = (m.TP!==undefined&&m.TN!==undefined&&m.FP!==undefined&&m.FN!==undefined)
+                 ? m.TP+m.TN+m.FP+m.FN : '?';
+        print('  '+lp(p[0].trim(),16)+'| '+lp(p[1].trim(),17)+'| '+
+          rp(n,4)+' '+rp(m.TP,4)+' '+rp(m.TN,4)+' '+rp(m.FP,4)+' '+rp(m.FN,4)+' | '+
+          pc(m.BA)+' '+pc(m.PA)+' '+pc(m.UA)+' | '+
+          pc(m.F1)+' '+pc(m.CSI)+' '+kf(m.Kappa));
+      }
+
+      // Accuracy tables include all methods (manuscript + reference-only)
+      var accMethods = [
+        ['A-VH          ', floodMap_VH],
+        ['B-VV          ', floodMap_VV],
+        ['C-MultiPol    ', floodMap_MP],
+        ['B-Otsu        ', floodMap_Otsu],
+        ['C-RF-S11(St1) ', floodMap_S11],
+        ['C-RF  (St2)   ', floodMap_RF],
+        ['A-Ratio (ref) ', floodMap_Ratio],
+        ['D-Ensemble(ref', floodMap_Ens],
+        ['GFM           ', gfmSmoothed]
+      ];
+
+      var accSections = [
+        ['EXTENDED — 50% PERSISTENCE  (main result)', vPts50e, 'Ext 50%  '],
+        ['EXTENDED — 60% PERSISTENCE',                vPts60e, 'Ext 60%  '],
+        ['EXTENDED — MAXIMUM EXTENT',                 vPtsMaxE,'Ext max  '],
+        ['EXTENDED — CROPLAND ONLY',                  vPtsCrop,'Crop 50% '],
+        ['RESTRICTED — 50% PERSISTENCE  ★',           vPts50r, 'Res 50% ★'],
+        ['RESTRICTED — MAXIMUM EXTENT  ★',            vPtsMaxR,'Res max ★']
+      ];
+
+      function runMethodStep(secIdx, mIdx) {
+        if (mIdx >= accMethods.length) {
+          runAccSection(secIdx + 1);
+          return;
+        }
+        var am  = accMethods[mIdx];
+        var sec = accSections[secIdx];
+        calcMetrics(am[1], sec[1], am[0]+'|'+sec[2]).evaluate(function(m, err) {
+          if (err || !m) {
+            print('  [ACC ERROR] ' + am[0].trim() + ': ' + err);
+            runMethodStep(secIdx, mIdx + 1);
+            return;
+          }
+          rowFmt(m);
+          runMethodStep(secIdx, mIdx + 1);
+        });
+      }
+
+      function runAccSection(secIdx) {
+        if (secIdx >= accSections.length) {
+          runThresholdSweep();
+          return;
+        }
+        if (secIdx === 0) {
+          print('');
+          print('═══════════════════════════════════════════════════════════════════════════');
+          print('  6a. ACCURACY — EXTENDED WINDOW');
+          print('═══════════════════════════════════════════════════════════════════════════');
+        }
+        if (secIdx === 4) {
+          print('');
+          print('═══════════════════════════════════════════════════════════════════════════');
+          print('  6b. ACCURACY — RESTRICTED WINDOW  ★ GFM-FAIR');
+          print('═══════════════════════════════════════════════════════════════════════════');
+        }
+        print(''); print('  ── ' + accSections[secIdx][0]); print(hdr); print(div);
+        runMethodStep(secIdx, 0);
+      }
+
+      function runThresholdSweep() {
+        print('');
+        print('  ── STAGE 2 RF PROBABILITY THRESHOLD SWEEP (Ext 50% validation) ──────');
+        print('  ' + lp('t',5) + lp('px',8) + lp('ha',7) +
+              lp('BA',8) + lp('PA',8) + lp('UA',8) +
+              lp('F1',8) + lp('CSI',8) + lp('κ',8) +
+              ' ← t=' + THR.rf_prob + ' is production');
+        print('  ' + Array(75).join('-'));
+
+        var thresholds = [0.3, 0.4, 0.5, 0.6, 0.7];
+
+        function sweepStep(idx) {
+          if (idx >= thresholds.length) {
+            runSec7();
+            return;
+          }
+          var t = thresholds[idx];
+          var rfBinT = rfProb.gte(t).toInt().rename('flood');
+          rfBinT.selfMask().rename('f')
+            .reduceRegion({reducer: ee.Reducer.count(), geometry: AOI,
+                           scale: 30, maxPixels: 1e10, bestEffort: true})
+            .evaluate(function(r, er) {
+              var px = (er || !r) ? 'ERR' : r.f;
+              var ha = (er || !r || !r.f) ? 'N/A' : ((r.f * 900) / 10000).toFixed(0);
+              calcMetrics(rfBinT, vPts50e, 'sweep|t' + t).evaluate(function(m, me) {
+                if (me || !m) {
+                  print('  t=' + t + ' ERROR: ' + me);
+                  sweepStep(idx + 1); return;
+                }
+                var pc = function(v){ return lp((!v&&v!==0)||isNaN(v)?'N/A':(v*100).toFixed(1)+'%',8); };
+                var kf = function(v){ return lp((!v&&v!==0)||isNaN(v)?'N/A':v.toFixed(3),8); };
+                var mk = Math.abs(t - THR.rf_prob) < 0.001 ? ' ← PRODUCTION' : '';
+                print('  ' + lp(t.toFixed(1),5) + lp(String(px),8) + lp(String(ha),7) +
+                      pc(m.BA) + pc(m.PA) + pc(m.UA) + pc(m.F1) + pc(m.CSI) + kf(m.Kappa) + mk);
+                sweepStep(idx + 1);
+              });
+            });
+        }
+        sweepStep(0);
+      }
+
+      // ── Section 7: Spatial comparison vs GFM ─────────────────────────────
+      function runSec7() {
+        print('');
+        print('═══════════════════════════════════════════════════════════════════════════');
+        print('  7. SPATIAL COMPARISON: OUR METHODS vs GFM');
+        print('  Agree=both detect | Our-only | GFM-only: JRC-wet vs non-JRC');
+        print('═══════════════════════════════════════════════════════════════════════════');
+
+        var gfmB        = gfmSmoothed.unmask(0);
+        var jrcWetMask0 = jrcWetMask.unmask(0);
+
+        function a30(img, band) {
+          return img.rename(band).multiply(ee.Image.pixelArea())
+            .reduceRegion({reducer: ee.Reducer.sum(), geometry: AOI,
+                           scale: 30, maxPixels: 1e10}).get(band);
+        }
+
+        var methods7 = [
+          ['A-VH Change',   floodMap_VH],
+          ['B-VV Change',   floodMap_VV],
+          ['C-MultiPol',    floodMap_MP],
+          ['B-Otsu',        floodMap_Otsu],
+          ['C-RF-S11(St1)', floodMap_S11],
+          ['C-RF (St2)',    floodMap_RF],
+          ['D-Ensemble',    floodMap_Ens]
+        ];
+
+        function sec7Step(idx) {
+          if (idx >= methods7.length) {
+            Map.addLayer(floodMap_Ens.unmask(0).and(gfmB).selfMask(),
+              {palette:['#2ecc71']}, '7. Ens∩GFM agree', false);
+            Map.addLayer(floodMap_Ens.unmask(0).and(gfmB.not()).selfMask(),
+              {palette:['#3498db']}, '7. Ens-only', false);
+            var gOE = gfmB.and(floodMap_Ens.unmask(0).not());
+            Map.addLayer(gOE.and(jrcWetMask0).selfMask(),       {palette:['#e67e22']}, '7. GFM-only JRC-wet',  false);
+            Map.addLayer(gOE.and(jrcWetMask0.not()).selfMask(), {palette:['#e74c3c']}, '7. GFM-only non-JRC',  false);
+            print('');
+            print('  ✓ v15 COMPLETE  |  Year: ' + YEAR);
+            print('  Stage 1: '+matchedS1Ids.length+' chip pairs → S1-only RF → s11_prob');
+            print('  Stage 2: Local RF (11 features incl. VH_flood) + s11_prob → C-RF map');
+            print('  B-VV   : VV per-scene Otsu change detection');
+            print('  C-MP   : VV+VH pooled freq fusion (threshold='+THR.mp_freq_min+')');
+            print('  Exports: NONE (removed in v15)');
+            return;
+          }
+          var m7    = methods7[idx];
+          var ourB  = m7[1].unmask(0);
+          var ag    = ourB.and(gfmB);
+          var ou    = ourB.and(gfmB.not());
+          var gf    = gfmB.and(ourB.not());
+          var gfJ   = gf.and(jrcWetMask0);
+          var gfN   = gf.and(jrcWetMask0.not());
+          ee.Dictionary({
+            ag: a30(ag,'f'), ou: a30(ou,'f'),
+            gf: a30(gf,'f'), gfJ: a30(gfJ,'f'), gfN: a30(gfN,'f'),
+            gt: a30(gfmB,'gfm')
+          }).evaluate(function(d, err) {
+            if (err || !d) { print('  [Comp ERROR] '+m7[0]+': '+err); sec7Step(idx+1); return; }
+            var cap     = (d.ag&&d.gt) ? (d.ag/d.gt*100).toFixed(1)+'%' : 'N/A';
+            var jPct    = d.gf>0 ? (d.gfJ/d.gf*100).toFixed(0) : 'N/A';
+            var nPct    = d.gf>0 ? (d.gfN/d.gf*100).toFixed(0) : 'N/A';
+            var resid   = d.gf>0 ? (d.gf-d.gfJ-d.gfN)/10000 : 0;
+            var note    = Math.abs(resid)<10 ? '✓ sum=100%' : '⚠ residual='+resid.toFixed(0)+' ha';
+            print('  '+lp(m7[0],18)+' | Agree='+rp(fha(d.ag),7)+' ha'+
+                  ' | Our-only='+rp(fha(d.ou),7)+' ha'+
+                  ' | GFM-only='+rp(fha(d.gf),7)+' ha | GFM capture='+cap);
+            print('    GFM-only: JRC-wet='+fha(d.gfJ)+' ha ('+jPct+
+                  '%)  non-JRC='+fha(d.gfN)+' ha ('+nPct+'%)  ['+note+']');
+            sec7Step(idx+1);
+          });
+        }
+        sec7Step(0);
+      }
+
+      runAccSection(0);
+
+    } // end runStage2()
+
+  }); // end listAssets LabelHand
+});   // end listAssets S1Hand
